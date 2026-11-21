@@ -27,6 +27,13 @@ function readStore(file){try{return JSON.parse(fs.readFileSync(file,'utf8'))}cat
 function writeStore(file,value){fs.mkdirSync(dataDir,{recursive:true});const temp=`${file}.${crypto.randomBytes(5).toString('hex')}.tmp`;fs.writeFileSync(temp,JSON.stringify(value,null,2));fs.renameSync(temp,file)}
 const units=['HS','A','MP','MA','SEAL','SOG','DIV','MMS','DF','USAF','AF','CG','MCE'];
 let leadershipCache={at:0,data:null};
+const onlineHighStaff=new Map();
+const discordPresenceState={configured:false,connected:false,guildReady:false,error:''};
+const highStaffMembers=new Map();
+const guildPresences=new Map();
+const guildMemberProfiles=new Map();
+let presenceSocket=null,presenceHeartbeat=null,presenceReconnect=null,presenceSequence=null,presenceRetry=0;
+const GATEWAY_INTENTS=1|2|256;
 async function getLeadership(){
  const {DISCORD_GUILD_ID:guildId,DISCORD_BOT_TOKEN:botToken,GENERAL_ROLE_ID:generalRole,DEPUTY_ROLE_ID:deputyRole}=process.env;
  if(!guildId||!botToken||!generalRole||!deputyRole)return {configured:false,general:null,deputies:[]};
@@ -39,6 +46,52 @@ async function getLeadership(){
 async function isHighStaff(userId){
  if(!process.env.DISCORD_GUILD_ID||!process.env.DISCORD_BOT_TOKEN||!process.env.HIGH_STAFF_ROLE_ID)return false;
  try{const response=await fetch(`https://discord.com/api/v10/guilds/${process.env.DISCORD_GUILD_ID}/members/${userId}`,{headers:{Authorization:`Bot ${process.env.DISCORD_BOT_TOKEN}`}});if(!response.ok)return false;const member=await response.json();return member.roles.includes(process.env.HIGH_STAFF_ROLE_ID)}catch{return false}
+}
+function updateHighStaffPresence(presence){
+ if(presence.guild_id&&presence.guild_id!==process.env.DISCORD_GUILD_ID)return;
+ const user=presence.user;if(!user?.id)return;
+ guildPresences.set(user.id,presence);publishHighStaffPresence(user.id);
+}
+function publishHighStaffPresence(userId){
+ const presence=guildPresences.get(userId),isMember=highStaffMembers.get(userId)===true;
+ if(!presence||!isMember||!['online','idle','dnd'].includes(presence.status)){onlineHighStaff.delete(userId);return}
+ const user={...(presence.user||{}),...(guildMemberProfiles.get(userId)||{})};
+ onlineHighStaff.set(userId,{id:userId,name:user.nick||user.global_name||user.username||'Discord участник',username:user.username||'',avatar:user.avatar?`https://cdn.discordapp.com/avatars/${userId}/${user.avatar}.png`:null,status:presence.status});
+}
+function startDiscordPresence(){
+ const {DISCORD_BOT_TOKEN:token,DISCORD_GUILD_ID:guildId,HIGH_STAFF_ROLE_ID:roleId}=process.env;
+ discordPresenceState.configured=!!(token&&guildId&&roleId);
+ if(!discordPresenceState.configured)return;
+ async function connect(){
+  if(typeof WebSocket==='undefined'){discordPresenceState.error='Node.js 22 or newer is required for Discord presence';return}
+  try{
+   const gatewayResponse=await fetch('https://discord.com/api/v10/gateway/bot',{headers:{Authorization:`Bot ${token}`}});if(!gatewayResponse.ok)throw Error(`Discord gateway lookup failed: ${gatewayResponse.status}`);
+   const gateway=await gatewayResponse.json();const gatewayUrl=new URL(gateway.url);gatewayUrl.searchParams.set('v','10');gatewayUrl.searchParams.set('encoding','json');
+   const socket=new WebSocket(gatewayUrl.href);presenceSocket=socket;
+   let heartbeatAck=true;
+   socket.addEventListener('message',async event=>{
+    try{
+     const raw=typeof event.data==='string'?event.data:await event.data.text();const packet=JSON.parse(raw);if(packet.s!==null&&packet.s!==undefined)presenceSequence=packet.s;
+     if(packet.op===10){const interval=packet.d.heartbeat_interval;presenceHeartbeat=setInterval(()=>{if(!heartbeatAck){socket.close();return}heartbeatAck=false;socket.send(JSON.stringify({op:1,d:presenceSequence}))},interval);socket.send(JSON.stringify({op:2,d:{token,intents:GATEWAY_INTENTS,properties:{os:process.platform,browser:'sang-reporting',device:'sang-reporting'}}}))}
+     else if(packet.op===11)heartbeatAck=true;
+     else if(packet.op===1)socket.send(JSON.stringify({op:1,d:presenceSequence}));
+     else if(packet.op===7){socket.close();}
+     else if(packet.op===9){socket.close();}
+     else if(packet.op===0){
+      const eventName=packet.t,data=packet.d;
+      if(eventName==='READY'){discordPresenceState.connected=true;presenceRetry=0}
+      if(eventName==='GUILD_CREATE'&&data.id===guildId){discordPresenceState.connected=true;discordPresenceState.guildReady=true;for(const member of data.members||[]){highStaffMembers.set(member.user.id,(member.roles||[]).includes(roleId));guildMemberProfiles.set(member.user.id,{...member.user,nick:member.nick,avatar:member.avatar||member.user.avatar})}for(const presence of data.presences||[])updateHighStaffPresence({...presence,guild_id:data.id})}
+      if(eventName==='PRESENCE_UPDATE'&&data.guild_id===guildId)updateHighStaffPresence(data);
+      if(eventName==='GUILD_MEMBER_UPDATE'&&data.guild_id===guildId){const isMember=(data.roles||[]).includes(roleId);highStaffMembers.set(data.user.id,isMember);guildMemberProfiles.set(data.user.id,{...data.user,nick:data.nick,avatar:data.avatar||data.user.avatar});publishHighStaffPresence(data.user.id)}
+      if(eventName==='GUILD_MEMBER_REMOVE'&&data.guild_id===guildId){highStaffMembers.delete(data.user.id);guildMemberProfiles.delete(data.user.id);guildPresences.delete(data.user.id);onlineHighStaff.delete(data.user.id)}
+     }
+    }catch(err){console.error('Discord presence packet error:',err.message)}
+   });
+   socket.addEventListener('close',event=>{if(presenceHeartbeat)clearInterval(presenceHeartbeat);presenceHeartbeat=null;presenceSocket=null;discordPresenceState.connected=false;discordPresenceState.guildReady=false;onlineHighStaff.clear();guildPresences.clear();highStaffMembers.clear();guildMemberProfiles.clear();if([4004,4013,4014].includes(event.code)){discordPresenceState.error=`Discord rejected bot token or intents (${event.code})`;return}presenceRetry++;presenceReconnect=setTimeout(connect,Math.min(30000,3000*presenceRetry))});
+   socket.addEventListener('error',()=>{discordPresenceState.error='Could not connect to Discord Gateway'});
+  }catch(err){discordPresenceState.error=err.message;presenceRetry++;presenceReconnect=setTimeout(connect,Math.min(30000,3000*presenceRetry))}
+ }
+ connect();
 }
 async function updateDiscordApplication(item,status,reviewer){
  const webhook=new URL(process.env.DISCORD_WEBHOOK_URL);const parts=webhook.pathname.split('/').filter(Boolean);if(parts.length<4)throw Error('Invalid Discord webhook URL');const webhookId=parts.at(-2),token=parts.at(-1);
@@ -62,6 +115,7 @@ const server=http.createServer(async(req,res)=>{
  }
  if(req.method==='GET'&&url.pathname==='/api/me'){const user=session(req);return json(res,200,{user,canReview:user?await isHighStaff(user.id):false})}
  if(req.method==='GET'&&url.pathname==='/api/leadership'){try{return json(res,200,await getLeadership())}catch(err){console.error(err.message);return json(res,502,{error:'Could not load Discord leadership'})}}
+ if(req.method==='GET'&&url.pathname==='/api/high-staff/online'){return json(res,200,{configured:discordPresenceState.configured,connected:discordPresenceState.connected,guildReady:discordPresenceState.guildReady,error:discordPresenceState.error,people:[...onlineHighStaff.values()].sort((a,b)=>a.name.localeCompare(b.name,'ru'))})}
  if(req.method==='GET'&&url.pathname==='/api/profile'){
    const user=session(req);if(!user)return json(res,401,{error:'Sign in with Discord first'});
    const profile=readStore(profilesFile)[user.id]||{};
@@ -95,4 +149,4 @@ const server=http.createServer(async(req,res)=>{
  if(req.method==='GET'&&!url.pathname.startsWith('/api/')&&!url.pathname.startsWith('/auth/')){const file=path.resolve(root,'.'+decodeURIComponent(url.pathname));if(file.startsWith(root+path.sep)&&fs.existsSync(file)&&fs.statSync(file).isFile()){res.writeHead(200,{'Content-Type':mime[path.extname(file)]||'application/octet-stream'});return fs.createReadStream(file).pipe(res)}}
  json(res,404,{error:'Not found'});
 });
-server.listen(port,()=>console.log(`SANG portal listening on http://localhost:${port}`));
+server.listen(port,()=>{console.log(`SANG portal listening on http://localhost:${port}`);startDiscordPresence()});
